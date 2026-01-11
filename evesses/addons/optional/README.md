@@ -19,13 +19,13 @@ Basic usage:
 ```gdscript
 # By returning an Option, it's clear that this function can return null, which must be handled
 func get_player_stats(id: String) -> Option:
-    return Option.None() # Represents a null
-    return Option.Some( data ) # Sucess!
+	return Option.None() # Represents a null
+	return Option.Some( data ) # Sucess!
 
 var res: Option = get_player_stats("player_3")
 if res.is_none():
-    print("Player doesn't exist!")
-    return
+	print("Player doesn't exist!")
+	return
 
 # Getting the contained value (in order of safety):
 var data = res.unwrap_or( 42 ) # Get from default value
@@ -188,7 +188,7 @@ Usage:
 # Declare enum
 static var AnimalState: EnumStruct = EnumStruct.new()\
     .add(&"Alive", { "is_hungry" : false })\
-    .add(&"Dead") # A dead animal can't be hungry
+	.add(&"Dead") # A dead animal can't be hungry
 
 # There are a couple ways to get an EnumStruct variant:
 var cat_state: EnumVariant = AnimalState.Alive
@@ -205,8 +205,8 @@ Notice how `EnumStruct`s and `EnumVariant`s can both be treated like normal obje
 The above code is the same as doing the following in Rust:
 ```rust
 enum AnimalState {
-    Alive{ is_hungry: bool },
-    Dead,
+	Alive{ is_hungry: bool },
+	Dead,
 }
 
 let cat_state: AnimalState = AnimalState::Alive{ is_hungry: true };
