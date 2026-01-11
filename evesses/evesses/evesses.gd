@@ -392,7 +392,7 @@ func process_pending_responses(ctx: Context) -> Result:
 	for trigger in sorted_responses:
 		if trigger.is_optional:
 			#TODO: in a real implementation, prompt the player here
-			#for now, auto-activate all optionals
+			#for now, auto-activate all optionals :sob:
 			pass
 		
 		#activate the trigger's effect (adds to chain stack)
