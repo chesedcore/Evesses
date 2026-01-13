@@ -1,6 +1,12 @@
 class_name Evesses
 extends RefCounted
 
+#NOTE!!!! This code uses Result and Option types from Tinne K's addon
+#          for proper error handling!!!
+#if you intend to implement your own, make sure:
+#Result must have: Ok(value), Err(error), is_ok(), is_err(), unwrap(), unwrap_or(), unwrap_err(), and_then(), map(), map_err()
+#Option must have: Some(value), None(), is_some(), is_none(), unwrap(), unwrap_or(), and_then(), map()
+
 #region Error Types
 
 class ActivationNegated:
@@ -29,6 +35,11 @@ class ConstraintViolated:
 	var constraint_name: String
 	func _init(name: String = ""):
 		constraint_name = name
+
+class InfiniteLoopDetected:
+	var iterations: int
+	func _init(i: int = 0):
+		iterations = i
 
 #endregion
 
@@ -130,6 +141,9 @@ var _chain_stack: Array = [] #stack of {effect, targets, ctx} waiting to resolve
 var _pending_responses: Array[Trigger] = [] #triggers waiting to activate
 var _timestamp: int = 0
 var _segoc_sorter: Callable #func(triggers: Array[Trigger]) -> Array[Trigger]
+var _floodgate_insertion_order: Dictionary = {} #floodgate -> order_index
+var _next_insertion_index: int = 0
+var _max_chain_iterations: int = 1000 #safety limit to prevent infinite loops
 
 #endregion
 
@@ -165,6 +179,9 @@ func end_timing(scope: String) -> void:
 func set_segoc_sorter(sorter: Callable) -> void:
 	_segoc_sorter = sorter
 
+func set_max_chain_iterations(max_iterations: int) -> void:
+	_max_chain_iterations = max_iterations
+
 func activate_effect(effect: Effect, ctx: Context) -> Result:
 	#only does REQUEST phase - adds to chain without resolving
 	return _request_phase(effect, ctx)
@@ -176,13 +193,39 @@ func clear_constraint_tracker() -> void:
 	_constraint_tracker.clear()
 
 func resolve_chain(ctx: Context) -> Result:
-	#resolves entire chain in reverse order, then processes any new responses
-	var result = _resolve_chain_stack()
-	if result.is_err():
-		return result
+	#resolves entire chain in reverse order, processing all triggered responses
+	#continues until both chain stack and pending responses are empty
+	var iterations = 0
 	
-	#after chain resolves, process any triggers that activated
-	return process_pending_responses(ctx)
+	while _chain_stack.size() > 0 or _pending_responses.size() > 0:
+		iterations += 1
+		if iterations > _max_chain_iterations:
+			return Result.Err(InfiniteLoopDetected.new(iterations))
+		
+		#resolve the current chain stack
+		if _chain_stack.size() > 0:
+			var result = _resolve_chain_stack()
+			if result.is_err():
+				return result
+		
+		#process any triggers that were activated
+		if _pending_responses.size() > 0:
+			var sorted = _segoc_sorter.call(_pending_responses.duplicate())
+			_pending_responses.clear()
+			
+			for trigger in sorted:
+				if trigger.is_optional:
+					#TODO: in a real implementation, prompt the player here
+					#for now, auto-activate all optionals
+					pass
+				
+				#activate the trigger's effect (adds to chain stack)
+				var result = _request_phase(trigger.effect, ctx)
+				if result.is_err():
+					#this trigger couldn't activate, skip it
+					continue
+	
+	return Result.Ok(null)
 
 #endregion
 
@@ -190,20 +233,53 @@ func resolve_chain(ctx: Context) -> Result:
 
 func _register_trigger(trigger: Trigger) -> void:
 	_active_triggers.append(trigger)
-	if trigger.lifetime_node and trigger.lifetime_node.has_signal("lifetime_expired"):
-		trigger.lifetime_node.lifetime_expired.connect(func(): _unregister_trigger(trigger))
+	
+	if trigger.lifetime_node:
+		#connect to both lifetime_expired signal (if exists) and tree_exited
+		if trigger.lifetime_node.has_signal("lifetime_expired"):
+			trigger.lifetime_node.lifetime_expired.connect(
+				func(): _unregister_trigger(trigger),
+				CONNECT_ONE_SHOT
+			)
+		
+		#always connect to tree_exited as a fallback
+		trigger.lifetime_node.tree_exited.connect(
+			func(): _unregister_trigger(trigger),
+			CONNECT_ONE_SHOT
+		)
 
 func _unregister_trigger(trigger: Trigger) -> void:
 	_active_triggers.erase(trigger)
 
 func _register_floodgate(floodgate: Floodgate) -> void:
 	_active_floodgates.append(floodgate)
-	_active_floodgates.sort_custom(func(a, b): return a.layer < b.layer)
-	if floodgate.lifetime_node and floodgate.lifetime_node.has_signal("lifetime_expired"):
-		floodgate.lifetime_node.lifetime_expired.connect(func(): _unregister_floodgate(floodgate))
+	_floodgate_insertion_order[floodgate] = _next_insertion_index
+	_next_insertion_index += 1
+	
+	#sort by layer, then by insertion order for same layer
+	_active_floodgates.sort_custom(func(a, b):
+		if a.layer != b.layer:
+			return a.layer < b.layer
+		return _floodgate_insertion_order[a] < _floodgate_insertion_order[b]
+	)
+	
+	if floodgate.lifetime_node:
+		#connect to both lifetime_expired signal (if exists) and tree_exited
+		if floodgate.lifetime_node.has_signal("lifetime_expired"):
+			floodgate.lifetime_node.lifetime_expired.connect(
+				func(): _unregister_floodgate(floodgate),
+				CONNECT_ONE_SHOT
+			)
+		
+		#always connect to tree_exited as a fallback
+		floodgate.lifetime_node.tree_exited.connect(
+			func(): _unregister_floodgate(floodgate),
+			CONNECT_ONE_SHOT
+		)
 
 func _unregister_floodgate(floodgate: Floodgate) -> void:
 	_active_floodgates.erase(floodgate)
+	_floodgate_insertion_order.erase(floodgate)
 
 #endregion
 
@@ -212,6 +288,10 @@ func _unregister_floodgate(floodgate: Floodgate) -> void:
 func _request_phase(effect: Effect, ctx: Context) -> Result:
 	#check constraints
 	for constraint in effect.constraints:
+		if constraint == null:
+			push_warning("null constraint in effect")
+			continue
+		
 		var result = constraint.call(ctx)
 		if result.is_err():
 			return result
@@ -219,20 +299,30 @@ func _request_phase(effect: Effect, ctx: Context) -> Result:
 	#check if activation is forbidden by floodgates
 	for floodgate in _active_floodgates:
 		if floodgate.phase == Phase.REQUEST and floodgate.type == "forbid":
+			if floodgate.forbid == null:
+				push_warning("forbid floodgate has null callable")
+				continue
+			
 			if floodgate.forbid.call(ctx, effect):
 				return Result.Err(ActionForbidden.new("forbidden by floodgate", floodgate))
 	
 	#check if cost can be paid (using checker)
-	var cost_check = effect.cost_checker.call(ctx)
-	if cost_check.is_err():
-		return cost_check
+	if effect.cost_checker != null:
+		var cost_check = effect.cost_checker.call(ctx)
+		if cost_check.is_err():
+			return cost_check
 	
 	#pay the cost (this cannot be negated)
-	var cost_result = effect.cost.call(ctx)
-	if cost_result.is_err():
-		return cost_result
+	if effect.cost != null:
+		var cost_result = effect.cost.call(ctx)
+		if cost_result.is_err():
+			return cost_result
 	
 	#select targets
+	if effect.target == null:
+		push_error("effect has null target callable")
+		return Result.Err("effect missing target callable")
+	
 	var target_result = effect.target.call(ctx)
 	if target_result.is_err():
 		return target_result
@@ -244,9 +334,6 @@ func _request_phase(effect: Effect, ctx: Context) -> Result:
 	return Result.Ok(null)
 
 func _resolution_phase(effect: Effect, targets, ctx: Context) -> Result:
-	#apply modify floodgates to the effect's actions
-	var modified_targets = targets
-	
 	#execute main action with floodgate modifications/replacements
 	var action_result = _execute_action_with_floodgates(effect.action, ctx, targets)
 	
@@ -254,7 +341,9 @@ func _resolution_phase(effect: Effect, targets, ctx: Context) -> Result:
 	if action_result.is_err():
 		var err = action_result.unwrap_err()
 		if err is ActivationNegated:
-			#effect activation was negated, don't commit anything
+			#effect activation was negated
+			#note: this is DIFFERENT from EffectNegated - activation negation means
+			#the effect never happened at all, so we don't log it
 			return Result.Err(err)
 		elif err is EffectNegated:
 			#effect was negated during resolution, log negation event
@@ -307,23 +396,35 @@ func _resolution_phase(effect: Effect, targets, ctx: Context) -> Result:
 	return _commit_phase(all_timing_events)
 
 func _execute_action_with_floodgates(action: Callable, ctx: Context, targets) -> Result:
+	if action == null:
+		push_error("attempted to execute null action")
+		return Result.Err("null action")
+	
 	#first, check if any replace floodgates want to swap this action
 	var final_action = action
+	var final_targets = targets
 	
 	for floodgate in _active_floodgates:
 		if floodgate.phase == Phase.RESOLUTION and floodgate.type == "replace":
-			#floodgate.replace takes (ctx, action_callable) and returns new action or same action
+			if floodgate.replace == null:
+				push_warning("replace floodgate has null callable")
+				continue
+			
+			#floodgate.replace takes (ctx, action_data) and returns new action or same action
 			var replaced = floodgate.replace.call(ctx, {
-				action = action,
-				targets = targets
+				action = final_action,
+				targets = final_targets
 			})
-			if replaced != null and replaced.has("action"):
-				final_action = replaced.action
+			
+			#validate return format
+			if replaced != null and replaced is Dictionary:
+				if replaced.has("action") and replaced.action != null:
+					final_action = replaced.action
 				if replaced.has("targets"):
-					targets = replaced.targets
+					final_targets = replaced.targets
 	
 	#execute the (possibly replaced) action
-	var result = final_action.call(ctx, targets)
+	var result = final_action.call(ctx, final_targets)
 	
 	#if action succeeded, apply modify floodgates to the result
 	if result.is_ok():
@@ -338,14 +439,23 @@ func _execute_action_with_floodgates(action: Callable, ctx: Context, targets) ->
 				action_result = ActionResult.new(true, action_result)
 			elif action_result == null:
 				action_result = ActionResult.new(false, [])
+			elif action_result is bool:
+				action_result = ActionResult.new(action_result, [])
+			elif typeof(action_result) == TYPE_INT and action_result == 0:
+				#0 might mean "nothing happened"
+				action_result = ActionResult.new(false, [])
 			else:
-				#assume it's some value that indicates success
+				#assume any other value indicates success (might be a bad idea later, any comments on this?)
 				action_result = ActionResult.new(true, [])
 		
-		#apply modify floodgates to timing events or values
+		#apply modify floodgates to timing events
 		for floodgate in _active_floodgates:
 			if floodgate.phase == Phase.RESOLUTION and floodgate.type == "modify":
-				#let floodgate modify the action result
+				if floodgate.modify == null:
+					push_warning("modify floodgate has null callable")
+					continue
+				
+				#let floodgate modify each timing event
 				for i in range(action_result.timing_events.size()):
 					var modified = floodgate.modify.call(ctx, action_result.timing_events[i])
 					if modified != null:
@@ -359,11 +469,10 @@ func _commit_phase(timing_events: Array) -> Result:
 	#add scope info to all timing events
 	for event in timing_events:
 		if event is TimingEvent:
-			event.scope_stack = _current_scope_stack.duplicate()
+			event.scope_stack = _current_scope_stack.duplicate(true) #might be a source of insane errors down the line
 			event.timestamp = _timestamp
 			_timestamp += 1
 	
-	#commit to history
 	_timing_history.append_array(timing_events)
 	
 	#find all triggers that match these timings
@@ -373,39 +482,19 @@ func _commit_phase(timing_events: Array) -> Result:
 			
 		for trigger in _active_triggers:
 			if trigger.timing == event.timing and trigger.layer == event.layer:
+				if trigger.filter == null:
+					push_warning("trigger has null filter callable")
+					continue
+				
 				if trigger.filter.call(event):
 					if not _pending_responses.has(trigger):
 						_pending_responses.append(trigger)
 	
 	return Result.Ok(null)
 
-func process_pending_responses(ctx: Context) -> Result:
-	#process all pending responses by building a new chain
-	if _pending_responses.is_empty():
-		return Result.Ok(null)
-	
-	#segoc sort the pending responses
-	var sorted_responses = _segoc_sorter.call(_pending_responses.duplicate())
-	_pending_responses.clear()
-	
-	#activate each response (goes through REQUEST phase only)
-	for trigger in sorted_responses:
-		if trigger.is_optional:
-			#TODO: in a real implementation, prompt the player here
-			#for now, auto-activate all optionals :sob:
-			pass
-		
-		#activate the trigger's effect (adds to chain stack)
-		var result = _request_phase(trigger.effect, ctx)
-		if result.is_err():
-			#this trigger couldn't activate, skip it
-			continue
-	
-	#now resolve the entire chain
-	return _resolve_chain_stack()
-
 func _resolve_chain_stack() -> Result:
 	#resolve chain in reverse order (last in, first out)
+	#please see Yugioh's chain resolution rules for a reference.
 	while _chain_stack.size() > 0:
 		var entry = _chain_stack.pop_back()
 		
@@ -447,6 +536,7 @@ func increment_usage(key: String) -> void:
 class EffectBuilder:
 	var _evesses: Evesses
 	var _effect: Effect
+	var _has_action: bool = false
 	
 	func _init(ev: Evesses):
 		_evesses = ev
@@ -469,7 +559,10 @@ class EffectBuilder:
 	
 	func once_per_turn(key: String = "") -> EffectBuilder:
 		var actual_key = key if key != "" else str(_effect.get_instance_id())
-		_effect.constraints.append(func(ctx):
+		#note: constraint is marked during REQUEST phase, before resolution
+		#this means "once per turn you can ACTIVATE this", not "once per turn this RESOLVES"
+		#this is correct for yugioh-style effects but may surprise users from other games
+		_effect.constraints.append(func(_ctx):
 			var result = _evesses.check_once_per_turn(actual_key)
 			if result.is_ok():
 				_evesses.mark_used(actual_key)
@@ -479,7 +572,7 @@ class EffectBuilder:
 	
 	func times_per_turn(max_times: int, key: String = "") -> EffectBuilder:
 		var actual_key = key if key != "" else str(_effect.get_instance_id())
-		_effect.constraints.append(func(ctx):
+		_effect.constraints.append(func(_ctx):
 			var result = _evesses.check_times_per_turn(actual_key, max_times)
 			if result.is_ok():
 				_evesses.increment_usage(actual_key)
@@ -493,6 +586,7 @@ class EffectBuilder:
 	
 	func action(action_func: Callable) -> EffectBuilder:
 		_effect.action = action_func
+		_has_action = true
 		return self
 	
 	func and_then(action_func: Callable) -> EffectBuilder:
@@ -502,7 +596,7 @@ class EffectBuilder:
 		})
 		return self
 	
-	func also(action_func: Callable) -> EffectBuilder:
+	func and_also(action_func: Callable) -> EffectBuilder:
 		_effect.compound_actions.append({
 			type = CompoundType.AND,
 			action = action_func
@@ -532,11 +626,16 @@ class EffectBuilder:
 		return self
 	
 	func build() -> Effect:
+		if not _has_action:
+			push_warning(
+	"Effect built with no action set - will use stub that does nothing. You can bypass this by throwing in a function that just passes."
+	)
 		return _effect
 
 class TriggerBuilder:
 	var _evesses: Evesses
 	var _trigger: Trigger
+	var _has_action: bool = false
 	
 	func _init(ev: Evesses, timing: String, layer: int):
 		_evesses = ev
@@ -556,7 +655,7 @@ class TriggerBuilder:
 	
 	func once_per_turn(key: String = "") -> TriggerBuilder:
 		var actual_key = key if key != "" else str(_trigger.get_instance_id())
-		_trigger.effect.constraints.append(func(ctx):
+		_trigger.effect.constraints.append(func(_ctx):
 			var result = _evesses.check_once_per_turn(actual_key)
 			if result.is_ok():
 				_evesses.mark_used(actual_key)
@@ -566,6 +665,7 @@ class TriggerBuilder:
 	
 	func action(action_func: Callable) -> TriggerBuilder:
 		_trigger.effect.action = action_func
+		_has_action = true
 		return self
 	
 	func and_then(action_func: Callable) -> TriggerBuilder:
@@ -580,6 +680,8 @@ class TriggerBuilder:
 		return self
 	
 	func build() -> Trigger:
+		if not _has_action:
+			push_warning("Trigger built with no action set - will use stub that does nothing")
 		_evesses._register_trigger(_trigger)
 		return _trigger
 
@@ -619,6 +721,8 @@ class FloodgateBuilder:
 		return self
 	
 	func build() -> Floodgate:
+		if _floodgate.type == "none":
+			push_warning("Floodgate built with no type (forbid/modify/replace) set")
 		_evesses._register_floodgate(_floodgate)
 		return _floodgate
 
@@ -629,7 +733,8 @@ class FloodgateBuilder:
 class Context:
 	#this is a stub that the user needs to extend
 	#it should provide all the actual game actions
-	#IMPORTANT: actions should return Result.Ok(ActionResult.new(succeeded, events))
+	#CRITICAL: actions should return Result.Ok(ActionResult.new(succeeded, events))
+	#where 'succeeded' is true if the action actually did something meaningful
 	
 	var evesses: Evesses
 	
@@ -637,27 +742,27 @@ class Context:
 		evesses = ev
 	
 	#example stub implementations
-	func pay_lp(amount: int) -> Result:
+	func pay_lp(_amount: int) -> Result:
 		push_error("pay_lp not implemented")
 		return Result.Err("not implemented")
 	
-	func discard(count: int) -> Result:
+	func discard(_count: int) -> Result:
 		push_error("discard not implemented")
 		return Result.Err("not implemented")
 	
-	func select_cards(count: int, filter: Callable) -> Result:
+	func select_cards(_count: int, _filter: Callable) -> Result:
 		push_error("select_cards not implemented")
 		return Result.Err("not implemented")
 	
-	func destroy(targets) -> Result:
+	func destroy(_targets) -> Result:
 		push_error("destroy not implemented")
 		return Result.Err("not implemented")
 	
-	func draw(count: int) -> Result:
+	func draw(_count: int) -> Result:
 		push_error("draw not implemented")
 		return Result.Err("not implemented")
 	
-	func banish(targets) -> Result:
+	func banish(_targets) -> Result:
 		push_error("banish not implemented")
 		return Result.Err("not implemented")
 	
