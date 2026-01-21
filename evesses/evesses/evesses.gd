@@ -71,22 +71,13 @@ class TimingEvent:
 		data = d
 		scope_stack = []
 
-class ActionResult:
-	#extended result type that tracks whether action actually did something
-	var succeeded: bool #did the action complete successfully?
-	var timing_events: Array[TimingEvent] #what timing events were generated?
-	
-	func _init(s: bool = false, events = []):
-		succeeded = s
-		timing_events = events if events is Array else [events] if events else []
-
 class Effect:
 	var tags: Array[String] = []
 	var cost: Callable #func(ctx: Context) -> Result
 	var cost_checker: Callable #func(ctx: Context) -> Result, for checking without mutating
 	var constraints: Array[Callable] = [] #array of func(ctx: Context) -> Result
 	var target: Callable #func(ctx: Context) -> Result (returns selected targets)
-	var action: Callable #func(ctx: Context, targets) -> Result
+	var action: Callable #func(ctx: Context, targets) -> Result<Option<Array[TimingEvent]>>
 	var compound_actions: Array[Dictionary] = [] #{type: CompoundType, action: Callable}
 	var lifetime_node: Node = null
 	
@@ -94,7 +85,7 @@ class Effect:
 		cost = func(_ctx): return Result.Ok(null)
 		cost_checker = func(_ctx): return Result.Ok(null)
 		target = func(_ctx): return Result.Ok([])
-		action = func(_ctx, _targets): return Result.Ok(ActionResult.new(false))
+		action = func(_ctx, _targets): return Result.Ok(Option.None())
 	
 	func has_tag(tag: String) -> bool:
 		return tags.has(tag)
@@ -354,12 +345,21 @@ func _resolution_phase(effect: Effect, targets, ctx: Context) -> Result:
 			return _commit_phase([negation_event])
 		return action_result
 	
-	var action_data: ActionResult = action_result.unwrap()
-	var all_timing_events = action_data.timing_events.duplicate()
+	#unwrap the option from the result
+	var option = action_result.unwrap()
+	var all_timing_events: Array[TimingEvent] = []
+	var previous_succeeded: bool = false
+	
+	if option.is_some():
+		var events = option.unwrap()
+		all_timing_events = events if events is Array else [events]
+		previous_succeeded = true
+	else:
+		#action did nothing
+		all_timing_events = []
+		previous_succeeded = false
 	
 	#execute compound actions based on their type
-	var previous_succeeded = action_data.succeeded
-	
 	for compound in effect.compound_actions:
 		var should_execute = false
 		
@@ -377,9 +377,15 @@ func _resolution_phase(effect: Effect, targets, ctx: Context) -> Result:
 			var compound_result = _execute_action_with_floodgates(compound.action, ctx, targets)
 			
 			if compound_result.is_ok():
-				var compound_data: ActionResult = compound_result.unwrap()
-				all_timing_events.append_array(compound_data.timing_events)
-				previous_succeeded = compound_data.succeeded
+				var compound_option = compound_result.unwrap()
+				
+				if compound_option.is_some():
+					var compound_events = compound_option.unwrap()
+					var events_array = compound_events if compound_events is Array else [compound_events]
+					all_timing_events.append_array(events_array)
+					previous_succeeded = true
+				else:
+					previous_succeeded = false
 			else:
 				#compound action failed
 				previous_succeeded = false
@@ -428,40 +434,50 @@ func _execute_action_with_floodgates(action: Callable, ctx: Context, targets) ->
 	
 	#if action succeeded, apply modify floodgates to the result
 	if result.is_ok():
-		var action_result = result.unwrap()
+		var action_value = result.unwrap()
 		
-		#convert various return types to ActionResult
-		if not (action_result is ActionResult):
-			#if user returned timing events directly, wrap them
-			if action_result is TimingEvent:
-				action_result = ActionResult.new(true, [action_result])
-			elif action_result is Array:
-				action_result = ActionResult.new(true, action_result)
-			elif action_result == null:
-				action_result = ActionResult.new(false, [])
-			elif action_result is bool:
-				action_result = ActionResult.new(action_result, [])
-			elif typeof(action_result) == TYPE_INT and action_result == 0:
-				#0 might mean "nothing happened"
-				action_result = ActionResult.new(false, [])
-			else:
-				#assume any other value indicates success (might be a bad idea later, any comments on this?)
-				action_result = ActionResult.new(true, [])
+		#convert various return types to Option
+		var option: Option
+		if action_value is Option:
+			#already an option, use as-is
+			option = action_value
+		elif action_value is TimingEvent:
+			#single timing event → Some([event])
+			option = Option.Some([action_value])
+		elif action_value is Array:
+			#array of events → Some(array) or None if empty
+			option = Option.Some(action_value) if not action_value.is_empty() else Option.None()
+		elif action_value == null:
+			#null → None (nothing happened)
+			option = Option.None()
+		elif action_value is bool:
+			#bool true → Some([]), bool false → None
+			option = Option.Some([]) if action_value else Option.None()
+		elif typeof(action_value) == TYPE_INT and action_value == 0:
+			#0 might mean "nothing happened"
+			option = Option.None()
+		else:
+			#assume any other value indicates success
+			option = Option.Some([])
 		
-		#apply modify floodgates to timing events
-		for floodgate in _active_floodgates:
-			if floodgate.phase == Phase.RESOLUTION and floodgate.type == "modify":
-				if floodgate.modify == null:
-					push_warning("modify floodgate has null callable")
-					continue
-				
-				#let floodgate modify each timing event
-				for i in range(action_result.timing_events.size()):
-					var modified = floodgate.modify.call(ctx, action_result.timing_events[i])
-					if modified != null:
-						action_result.timing_events[i] = modified
+		#apply modify floodgates to timing events (if any)
+		if option.is_some():
+			var events = option.unwrap()
+			if events is Array:
+				for floodgate in _active_floodgates:
+					if floodgate.phase == Phase.RESOLUTION and floodgate.type == "modify":
+						if floodgate.modify == null:
+							push_warning("modify floodgate has null callable")
+							continue
+						
+						#let floodgate modify each timing event
+						for i in range(events.size()):
+							if events[i] is TimingEvent:
+								var modified = floodgate.modify.call(ctx, events[i])
+								if modified != null:
+									events[i] = modified
 		
-		return Result.Ok(action_result)
+		return Result.Ok(option)
 	
 	return result
 
@@ -733,13 +749,22 @@ class FloodgateBuilder:
 class Context:
 	#this is a stub that the user needs to extend
 	#it should provide all the actual game actions
-	#CRITICAL: actions should return Result.Ok(ActionResult.new(succeeded, events))
-	#where 'succeeded' is true if the action actually did something meaningful
+	#CRITICAL: actions should return Result.Ok(Option.Some(events)) for success
+	#                                or Result.Ok(Option.None()) for "nothing happened"
 	
 	var evesses: Evesses
 	
 	func _init(ev: Evesses):
 		evesses = ev
+	
+	#convenience helpers for returning common Result<Option<Array[Timing]>>
+	func some(...events: Array) -> Result:
+		if events.is_empty():
+			return Result.Ok(Option.Some([]))
+		return Result.Ok(Option.Some(events))
+	
+	func none() -> Result:
+		return Result.Ok(Option.None())
 	
 	#example stub implementations
 	func pay_lp(_amount: int) -> Result:
