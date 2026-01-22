@@ -46,6 +46,45 @@ or a ["Trigger Effect"](#trigger-effects) (effects that are pre-registered on th
 There are also ["Floodgates"](#floodgates) (effects that modify or negate other effects).
 Once you're done reading up, see [chain resolution](#chain-resolution) to learn how to activate and resolve an effect.
 
+Here is an example showing you how the system functions:
+```gdscript
+class MyCtx: #a mini context holding a small world state for demo purposes
+    var hand = ["A","B","C","D"]
+    var lp = 8000
+    func draw(n):
+        var drawn = []
+        for i in n:
+            if hand.empty(): break
+            drawn.append(hand.pop_back())
+        return drawn
+    func gain_lp(n):
+        lp += n
+
+var ctx = MyCtx.new()
+var ev = Evesses.new()
+
+# Trigger! gain 500 LP when a card is drawn
+ev.on_timing("card_drawn", 2).mandatory().action(func(c,e):
+    c.gain_lp(500)
+    return some()
+).build()
+
+# Effect! draw 2 cards
+var pot = ev.direct_effect().action(func(c,_):
+    var drawn = c.draw(2)
+    for card in drawn:
+        ev.add_timing(Evesses.TimingEvent.new("card_drawn",2,{"card":card,"player":c}))
+    return some()
+).build()
+
+# Activate effect and resolve chain like as such
+ev.activate_effect(pot, ctx)
+ev.resolve_chain(ctx)
+
+print("Hand:", ctx.hand)
+print("LP:", ctx.lp)
+```
+
 
 ## Setup
 
